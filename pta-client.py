@@ -1,80 +1,120 @@
 import socket
 import threading
+import os
 
-def handle_client(connection, address, valid_users, files_directory):
-    print(f"Conexão estabelecida com {address}")
-    seq_num = None
-    authenticated = False
-    try:
-        while True:
-            data = connection.recv(1024).decode('ascii')
-            if not data:
-                break
-            parts = data.strip().split(' ')
-            if len(parts) < 2:
-                connection.send(f"{seq_num if seq_num else '0'} NOK".encode('ascii'))
-                continue
+class PTAServer:
+    def __init__(self, host, port, users_file, files_directory):
+        self.host = host
+        self.port = port
+        self.valid_users = self.load_users(users_file)
+        self.files_directory = files_directory
 
-            seq_num = parts[0]
-            command = parts[1]
-            args = parts[2:] if len(parts) > 2 else None
-          
-            if command == 'CUMP':
-                if args and args[0] in valid_users:
-                    authenticated = True
-                    connection.send(f"{seq_num} OK".encode('ascii'))
-                else:
-                    connection.send(f"{seq_num} NOK".encode('ascii'))
+    def load_users(self, users_file):
+        with open(users_file, 'r') as f:
+            return [line.strip() for line in f.readlines()]
+
+    def handle_client(self, connection, address):
+        print(f"Conexão estabelecida com {address}")
+        seq_num = None
+        authenticated = False
+        try:
+            while True:
+                data = connection.recv(1024).decode('ascii')
+                if not data:
                     break
-            elif command == 'LIST' and authenticated:
-                try:
-                    files = ','.join(os.listdir(files_directory))
-                    num_files = len(files.split(','))
-                    connection.send(f"{seq_num} ARQS {num_files} {files}".encode('ascii'))
-                except Exception as e:
-                    connection.send(f"{seq_num} NOK".encode('ascii'))
 
-            elif command == 'PEGA' and authenticated:
-                if args:
-                    filename = args[0]
-                    filepath = f"{files_directory}/{filename}"
-                    if os.path.isfile(filepath):
-                        with open(filepath, 'rb') as f:
-                            file_content = f.read()
-                        file_size = len(file_content)
-                        connection.send(f"{seq_num} ARQ {file_size} ".encode('ascii') + file_content)
-                    else:
-                        connection.send(f"{seq_num} NOK".encode('ascii'))
+                seq_num, command, args = self.parse_message(data)
+
+                if not seq_num or not command:
+                    connection.send(f"{seq_num if seq_num else '0'} NOK".encode('ascii'))
+                    continue
+
+                if command == 'CUMP':
+                    authenticated = self.authenticate(args, connection, seq_num)
+                    if not authenticated:
+                        break
+                elif command == 'LIST' and authenticated:
+                    self.list_files(connection, seq_num)
+                elif command == 'PEGA' and authenticated:
+                    self.send_file(connection, args, seq_num)
+                elif command == 'TERM' and authenticated:
+                    self.terminate_connection(connection, seq_num)
+                    break
                 else:
                     connection.send(f"{seq_num} NOK".encode('ascii'))
+        except Exception as e:
+            print(f"Erro: {e}")
+        finally:
+            connection.close()
 
-            elif command == 'TERM' and authenticated:
-                connection.send(f"{seq_num} OK".encode('ascii'))
-                break
+    def parse_message(self, data):
+        parts = data.strip().split(' ')
+        seq_num = parts[0] if len(parts) > 0 else None
+        command = parts[1] if len(parts) > 1 else None
+        args = parts[2:] if len(parts) > 2 else None
+        return seq_num, command, args
 
+    def authenticate(self, args, connection, seq_num):
+        if args and args[0] in self.valid_users:
+            connection.send(f"{seq_num} OK".encode('ascii'))
+            return True
+        else:
+            connection.send(f"{seq_num} NOK".encode('ascii'))
+            return False
+
+    def list_files(self, connection, seq_num):
+        try:
+            files = ','.join(os.listdir(self.files_directory))
+            num_files = len(files.split(',')) if files else 0
+            connection.send(f"{seq_num} ARQS {num_files} {files}".encode('ascii'))
+        except Exception:
+            connection.send(f"{seq_num} NOK".encode('ascii'))
+
+    def send_file(self, connection, args, seq_num):
+        if args:
+            filename = args[0]
+            filepath = os.path.join(self.files_directory, filename)
+            if os.path.isfile(filepath):
+                try:
+                    with open(filepath, 'rb') as f:
+                        file_content = f.read()
+                    file_size = len(file_content)
+                    connection.send(f"{seq_num} ARQ {file_size} ".encode('ascii') + file_content)
+                except Exception:
+                    connection.send(f"{seq_num} NOK".encode('ascii'))
             else:
                 connection.send(f"{seq_num} NOK".encode('ascii'))
-    except Exception as e:
-        print(f"Erro: {e}")
-    finally:
-        connection.close()
+        else:
+            connection.send(f"{seq_num} NOK".encode('ascii'))
+
+    def terminate_connection(self, connection, seq_num):
+        connection.send(f"{seq_num} OK".encode('ascii'))
+
+    def start_server(self):
+        server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server_socket.bind((self.host, self.port))
+        server_socket.listen(5)
+        print("Servidor PTA aguardando conexões...")
+
+        while True:
+            connection, address = server_socket.accept()
+            client_thread = threading.Thread(target=self.handle_client, args=(connection, address))
+            client_thread.start()
+
 
 def main():
-    with open('pta-server/users.txt', 'r') as f:
-        valid_users = [line.strip() for line in f.readlines()]
+    try:
+        server = PTAServer(
+            host='0.0.0.0',
+            port=11550,
+            users_file='pta-server/users.txt',
+            files_directory='pta-server/files'
+        )
+        server.start_server()
+    except Exception as e:
+        print(f"Erro ao iniciar o servidor: {e}")
+        input("Pressione Enter para fechar...")
 
-    files_directory = 'pta-server/files'
-
-    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server_socket.bind(('0.0.0.0', 11550))
-    server_socket.listen(5)
-    print("Servidor PTA aguardando conexões...")
-
-    while True:
-        connection, address = server_socket.accept()
-        client_thread = threading.Thread(target=handle_client, args=(connection, address, valid_users, files_directory))
-        client_thread.start()
 
 if __name__ == '__main__':
-    import os
     main()
