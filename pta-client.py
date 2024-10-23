@@ -1,120 +1,238 @@
-import socket
-import threading
-import os
+import sys
+import random
+from socket import *
 
-class PTAServer:
-    def __init__(self, host, port, users_file, files_directory):
-        self.host = host
-        self.port = port
-        self.valid_users = self.load_users(users_file)
-        self.files_directory = files_directory
+cnt =0
 
-    def load_users(self, users_file):
-        with open(users_file, 'r') as f:
-            return [line.strip() for line in f.readlines()]
+def connection(ip,port):
+  global cnt
+  cnt = 0
+  clientSocket = socket(AF_INET, SOCK_STREAM)
+  clientSocket.connect((ip,port))
+  return clientSocket
 
-    def handle_client(self, connection, address):
-        print(f"Conexão estabelecida com {address}")
-        seq_num = None
-        authenticated = False
+def hardClose(sckt):
+  sckt.close()
+
+def softClose(sckt):
+  global cnt
+  msg = str(cnt)+" TERM"
+  sckt.send(msg.encode())
+  cnt += 1
+  data, addr = sckt.recvfrom(2048)
+  data = data.decode()
+  mess = data.strip("\n").split(" ")
+  try:
+    if (mess[1] == "OK"):
+      sckt.close()
+      print("TERM is OK!")
+    else:
+      sckt.close()
+      print("Error in TERM!")
+  except Exception as e:
+    print("Error in TERM!")
+    print(e)
+    sckt.close()
+
+#test acknowledgment phase
+#bad = 1 iff the user does not exist
+#bad = 0 iff the user exists
+def test1(sckt, user, bad):
+  global cnt
+  msg = str(cnt)+" CUMP "+user
+  sckt.send(msg.encode())
+  cnt += 1
+  data, addr = sckt.recvfrom(2048)
+  data = data.decode()
+  mess = data.strip("\n").split(" ")
+  if len(mess) != 2:
+    return -2
+  if (not int(mess[0]) == cnt-1):
+    return -2
+  if (mess[1] == "OK"):
+    return -1 if bad == 1 else 1
+  elif (mess[1] == "NOK"):
+    return 1 if bad == 1 else -1
+  else:
+    return -2
+
+#test not expected commands
+def test2(sckt):
+  global cnt
+  msg = str(cnt)+" TRAP"
+  sckt.send(msg.encode())
+  cnt += 1
+  data, addr = sckt.recvfrom(2048)
+  data = data.decode()
+  print(data)
+  mess = data.strip("\n").split(" ")
+  if len(mess) != 2:
+    return -2
+  if (not int(mess[0]) == cnt-1):
+    return -2
+  if (mess[1] == "NOK"):
+    return 1
+  else:
+    return -1
+
+#test list phase
+def test3(sckt):
+  global cnt
+  msg = str(cnt)+" LIST"
+  sckt.send(msg.encode())
+  cnt += 1
+  data1 = ""
+  commandUnknow = True
+  excep = False
+  fileCnt = 0
+  while 1:
+    data, addr = sckt.recvfrom(2048)
+    data = data.decode()
+    if commandUnknow:
         try:
-            while True:
-                data = connection.recv(1024).decode('ascii')
-                if not data:
-                    break
-
-                seq_num, command, args = self.parse_message(data)
-
-                if not seq_num or not command:
-                    connection.send(f"{seq_num if seq_num else '0'} NOK".encode('ascii'))
-                    continue
-
-                if command == 'CUMP':
-                    authenticated = self.authenticate(args, connection, seq_num)
-                    if not authenticated:
-                        break
-                elif command == 'LIST' and authenticated:
-                    self.list_files(connection, seq_num)
-                elif command == 'PEGA' and authenticated:
-                    self.send_file(connection, args, seq_num)
-                elif command == 'TERM' and authenticated:
-                    self.terminate_connection(connection, seq_num)
-                    break
-                else:
-                    connection.send(f"{seq_num} NOK".encode('ascii'))
+            commandUnknow = False
+            splitteddata = data.split(" ")
+            if splitteddata[1] == "ARQS":
+                filesTotal = int(splitteddata[2])
+                fileCnt += len(data.split(",")) 
         except Exception as e:
-            print(f"Erro: {e}")
-        finally:
-            connection.close()
+          print(e)
+          excep = True
+          break
+    else:
+        fileCnt += len(data.split(","))
+    data1 += data
+    if fileCnt >= filesTotal:
+        break
 
-    def parse_message(self, data):
-        parts = data.strip().split(' ')
-        seq_num = parts[0] if len(parts) > 0 else None
-        command = parts[1] if len(parts) > 1 else None
-        args = parts[2:] if len(parts) > 2 else None
-        return seq_num, command, args
+  if not excep:
+    print(data1)
+    files = data1.split(",")
+    firstFile = files[0].split(" ",3)
+    files[0] = firstFile[3]
+    mess = data1.split(" ")
+  else:
+    return (-2,"")
+  
+  if len(mess) < 4:
+    return (-2,"")
+  if (not int(mess[0]) == cnt-1):
+    return (-2,"")
+  if (mess[1] == "ARQS"):
+    return (1,files)
+  elif (mess == "NOK"):
+    return (0,"")
+  else:
+    return (-2,"")
 
-    def authenticate(self, args, connection, seq_num):
-        if args and args[0] in self.valid_users:
-            connection.send(f"{seq_num} OK".encode('ascii'))
-            return True
-        else:
-            connection.send(f"{seq_num} NOK".encode('ascii'))
-            return False
-
-    def list_files(self, connection, seq_num):
+#test arq phase
+def test4(sckt,arq,bad):
+  global cnt
+  msg = str(cnt)+" PEGA "+arq
+  sckt.send(msg.encode())
+  cnt += 1
+  data1 = ""
+  commandUnknow = True
+  byteCnt = 0
+  data2 = None
+  while 1:
+    data, addr = sckt.recvfrom(2048)
+    data = data.decode()
+    if commandUnknow:
         try:
-            files = ','.join(os.listdir(self.files_directory))
-            num_files = len(files.split(',')) if files else 0
-            connection.send(f"{seq_num} ARQS {num_files} {files}".encode('ascii'))
-        except Exception:
-            connection.send(f"{seq_num} NOK".encode('ascii'))
+            commandUnknow = False
+            splitteddata = data.split(" ",3)
+            if splitteddata[1] == "ARQ":
+                bytesTotal = int(splitteddata[2])
+                data2 = splitteddata[3]
+                byteCnt += len(data2)
+            elif "NOK" in data:
+              data1 += data
+              break
+        except Exception as e:
+          print(e)
+          break
+    else:
+      data2 += data
+      byteCnt += len(data)
+    
+    data1 += data
+    print(byteCnt,bytesTotal)
+    if byteCnt >= bytesTotal:
+      break
 
-    def send_file(self, connection, args, seq_num):
-        if args:
-            filename = args[0]
-            filepath = os.path.join(self.files_directory, filename)
-            if os.path.isfile(filepath):
-                try:
-                    with open(filepath, 'rb') as f:
-                        file_content = f.read()
-                    file_size = len(file_content)
-                    connection.send(f"{seq_num} ARQ {file_size} ".encode('ascii') + file_content)
-                except Exception:
-                    connection.send(f"{seq_num} NOK".encode('ascii'))
-            else:
-                connection.send(f"{seq_num} NOK".encode('ascii'))
-        else:
-            connection.send(f"{seq_num} NOK".encode('ascii'))
+  if data2:
+    f = open(arq,"w")
+    f.write(data2)
+    f.close()
 
-    def terminate_connection(self, connection, seq_num):
-        connection.send(f"{seq_num} OK".encode('ascii'))
+  mess = data1.split(" ",3)
+  if bad == 0 and len(mess) < 4:
+    return -2
+  if bad == 1 and len(mess) < 2:
+    return -2
+  if (not int(mess[0]) == cnt-1):
+    return -2
+  if (mess[1] == "ARQ"):
+    return -1 if bad == 1 else 1
+  elif (mess[1] == "NOK"):
+    return 1 if bad == 1 else -1
+  else:
+    return -2
 
-    def start_server(self):
-        server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        server_socket.bind((self.host, self.port))
-        server_socket.listen(5)
-        print("Servidor PTA aguardando conexões...")
+if __name__ == "__main__":
+  if len(sys.argv) <= 3:
+    print("Usage: pta-client.py <server-ip> <server-port> <user>")
+    sys.exit(2)
+  serverIp = sys.argv[1]
+  serverPort = int(sys.argv[2])
+  user = sys.argv[3]
 
-        while True:
-            connection, address = server_socket.accept()
-            client_thread = threading.Thread(target=self.handle_client, args=(connection, address))
-            client_thread.start()
+  points = 0
 
+  #Testing bad command
+  print("Testing command without CUMP")
+  cSocket = connection(serverIp,serverPort)
+  points += test2(cSocket)
+  print("Points: %d/6" % points)
+  hardClose(cSocket)
 
-def main():
-    try:
-        server = PTAServer(
-            host='0.0.0.0',
-            port=11550,
-            users_file='pta-server/users.txt',
-            files_directory='pta-server/files'
-        )
-        server.start_server()
-    except Exception as e:
-        print(f"Erro ao iniciar o servidor: {e}")
-        input("Pressione Enter para fechar...")
+  #Testing bad CUMP command
+  print("Testing CUMP with bad user")
+  cSocket = connection(serverIp,serverPort)
+  points += test1(cSocket,"laser1212",1)
+  print("Points: %d/6" % points)
+  hardClose(cSocket)
 
+  #Testing good CUMP command
+  print("Testing CUMP with good user")
+  cSocket = connection(serverIp,serverPort)
+  points += test1(cSocket,user,0)
+  print("Points: %d/6" % points)
 
-if __name__ == '__main__':
-    main()
+  #Testing LIST
+  print("Testing LIST")
+  (pts,arqs) = test3(cSocket)
+  points += pts
+  print("Points: %d/6" % points)
+  if not arqs == "":
+    arq = random.choice(arqs)
+  else:
+    arq = "teste"
+
+  #Testing ARQ
+  print("Testing ARQ with good file")
+  if arq:
+     points += test4(cSocket,arq,0)
+  else:
+     points += -2
+  print("Points: %d/6" % points)
+
+  #Testing ARQ
+  print("Testing ARQ with bad file")
+  points += test4(cSocket,"novo_arquivo",1)
+  print("Points: %d/6" % points)
+
+  #Testing TERM
+  print("Testing TERM")
+  softClose(cSocket)
